@@ -12,7 +12,7 @@ from utils.lr_scheduler import LR_Scheduler
 from utils.saver import Saver
 from utils.summaries import TensorboardSummary
 from utils.metrics import Evaluator
-from auto_deeplab import AutoDeeplab
+from model_search import AutoDeeplab
 from architect import Architect
 
 class Trainer(object):
