@@ -234,7 +234,7 @@ class AutoDeeplab (nn.Module):
                 count += 1
                 level16_new = w_beta[4][2] * level16_new_1 + w_beta[5][1] * level16_new_2
 
-                level32_new = self.cells[count](None, s1[3], w_alpha)
+                level32_new = self.cells[count](None, s1[2], w_alpha)
                 level32_new = level32_new * w_beta[5][2]
                 count += 1
 
