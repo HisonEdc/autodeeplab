@@ -182,7 +182,7 @@ def main():
     parser = argparse.ArgumentParser(description="AutoDeeplab")
     parser.add_argument('--backbone', type=str, default='resnet', choices=['resnet', 'xception', 'drn', 'mobilenet'], help='backbone name (default: resnet)')
     parser.add_argument('--out_stride', type=int, default=16, help='network output stride (default: 8)')
-    parser.add_argument('--dataset', type=str, default='kd', choices=['pascal', 'coco', 'cityscapes', 'kd'], help='dataset name (default: pascal)')
+    parser.add_argument('--dataset', type=str, default='pascal', choices=['pascal', 'coco', 'cityscapes', 'kd'], help='dataset name (default: pascal)')
     parser.add_argument('--use_sbd', action='store_true', default=False, help='whether to use SBD dataset (default: True)')
     parser.add_argument('--workers', type=int, default=0, metavar='N', help='dataloader threads')
     parser.add_argument('--base_size', type=int, default=224, help='base image size')
@@ -243,7 +243,7 @@ def main():
         args.epochs = epoches[args.dataset.lower()]
 
     if args.batch_size is None:
-        args.batch_size = 4 * len(args.gpu_ids)
+        args.batch_size = 2 * len(args.gpu_ids)
 
     if args.test_batch_size is None:
         args.test_batch_size = args.batch_size
