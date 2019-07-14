@@ -1,0 +1,555 @@
+import torch
+import torch.nn as nn
+import numpy as np
+from operations import *
+from torch.autograd import Variable
+from genotypes import PRIMITIVES
+import torch.nn.functional as F
+import math
+
+
+class MixedOp(nn.Module):
+    def __init__(self, C, stride):
+        super(MixedOp, self).__init__()
+        self._ops = nn.ModuleList()
+        for primitive in PRIMITIVES:
+            op = OPS[primitive](C, stride, False)
+            if 'pool' in primitive:
+                op = nn.Sequential(op, nn.BatchNorm2d(C, affine=False))
+            self._ops.append(op)
+
+    def forward(self, x, weights):
+        return sum(w * op(x) for w, op in zip(weights, self._ops))
+
+
+class Cell(nn.Module):
+    def __init__(self, steps, C_prev_prev, C_prev, C, rate):
+        super(Cell, self).__init__()
+        self.C_out = C
+        if C_prev_prev != -1:
+            self.preprocess0 = ReLUConvBN(C_prev_prev, C, 1, 1, 0, affine=False)
+        if rate == 2:
+            self.preprocess1 = FactorizedReduce(C_prev, C, affine=False)
+        elif rate == 0:
+            self.preprocess1 = FactorizedIncrease(C_prev, C, affine=False)
+        else:
+            self.preprocess1 = ReLUConvBN(C_prev, C, 1, 1, 0, affine=False)
+        self._steps = steps
+        self._ops = nn.ModuleList()
+        for i in range(self._steps):
+            for j in range(2+i):
+                stride = 1
+                op = MixedOp(C, stride)
+                self._ops.append(op)
+        self.ReLUConvBN = ReLUConvBN(self._steps * self.C_out, self.C_out, 1, 1, 0)
+
+    def forward(self, s0, s1, weights):
+        if s0 is not None:
+            s0 = self.preprocess0(s0)
+        s1 = self.preprocess1(s1)
+        if s0 is not None:
+            states = [s0, s1]
+        else:
+            states = [s1, s1]
+        offset = 0
+        for i in range(self._steps):
+            s = sum(self._ops[offset+j](h, weights[offset+j]) for j, h in enumerate(states))
+            offset += len(states)
+            states.append(s)
+
+        concat_feature = torch.cat(states[-self._steps:], dim=1)
+        return self.ReLUConvBN(concat_feature)
+
+class AutoDeeplab (nn.Module):
+    def __init__(self, num_classes, num_layers, criterion, multiplier=8, steps=5):
+        super(AutoDeeplab, self).__init__()
+
+        self.cells = nn.ModuleList()
+        self._num_layers = num_layers
+        self._num_classes = num_classes
+        self._steps = steps
+        self._multiplier = multiplier
+        self._num_channels = [int(self._steps * self._multiplier * math.pow(2, i + 1) / 4) for i in range(5)]
+        self._criterion = criterion
+        self._initialize_alphas()
+        self.stem1 = nn.Sequential(
+            nn.Conv2d(3, self._num_channels[0], 3, padding=1),
+            nn.BatchNorm2d(self._num_channels[0])
+        )
+        self.stem2 = nn.Sequential(
+            nn.Conv2d(self._num_channels[0], self._num_channels[1], 3, stride=2, padding=1),
+            nn.BatchNorm2d(self._num_channels[1])
+        )
+
+        for i in range(self._num_layers):
+            if i == 0:
+                cell1 = Cell(self._steps, -1, self._num_channels[1], self._num_channels[1], 1)
+                cell2 = Cell(self._steps, -1, self._num_channels[1], self._num_channels[2], 2)
+
+                self.cells += [cell1, cell2]
+
+            elif i == 1:
+                cell1_1 = Cell(self._steps, self._num_channels[1], self._num_channels[1], self._num_channels[1], 1)
+                cell1_2 = Cell(self._steps, self._num_channels[1], self._num_channels[2], self._num_channels[1], 0)
+                cell2_1 = Cell(self._steps, -1, self._num_channels[1], self._num_channels[2], 2)
+                cell2_2 = Cell(self._steps, -1, self._num_channels[2], self._num_channels[2], 1)
+                cell3   = Cell(self._steps, -1, self._num_channels[2], self._num_channels[3], 2)
+
+                self.cells += [cell1_1, cell1_2, cell2_1, cell2_2, cell3]
+
+            elif i == 2:
+                cell1_1 = Cell(self._steps, self._num_channels[1], self._num_channels[1], self._num_channels[1], 1)
+                cell1_2 = Cell(self._steps, self._num_channels[1], self._num_channels[2], self._num_channels[1], 0)
+                cell2_1 = Cell(self._steps, self._num_channels[2], self._num_channels[1], self._num_channels[2], 2)
+                cell2_2 = Cell(self._steps, self._num_channels[2], self._num_channels[2], self._num_channels[2], 1)
+                cell2_3 = Cell(self._steps, self._num_channels[2], self._num_channels[3], self._num_channels[2], 0)
+                cell3_1 = Cell(self._steps, -1, self._num_channels[2], self._num_channels[3], 2)
+                cell3_2 = Cell(self._steps, -1, self._num_channels[3], self._num_channels[3], 1)
+                cell4   = Cell(self._steps, -1, self._num_channels[3], self._num_channels[4], 2)
+
+                self.cells += [cell1_1, cell1_2, cell2_1, cell2_2, cell2_3, cell3_1, cell3_2, cell4]
+
+            elif i == 3:
+                cell1_1 = Cell(self._steps, self._num_channels[1], self._num_channels[1], self._num_channels[1], 1)
+                cell1_2 = Cell(self._steps, self._num_channels[1], self._num_channels[2], self._num_channels[1], 0)
+                cell2_1 = Cell(self._steps, self._num_channels[2], self._num_channels[1], self._num_channels[2], 2)
+                cell2_2 = Cell(self._steps, self._num_channels[2], self._num_channels[2], self._num_channels[2], 1)
+                cell2_3 = Cell(self._steps, self._num_channels[2], self._num_channels[3], self._num_channels[2], 0)
+                cell3_1 = Cell(self._steps, self._num_channels[3], self._num_channels[2], self._num_channels[3], 2)
+                cell3_2 = Cell(self._steps, self._num_channels[3], self._num_channels[3], self._num_channels[3], 1)
+                cell3_3 = Cell(self._steps, self._num_channels[3], self._num_channels[4], self._num_channels[3], 0)
+                cell4_1 = Cell(self._steps, -1, self._num_channels[3], self._num_channels[4], 2)
+                cell4_2 = Cell(self._steps, -1, self._num_channels[4], self._num_channels[4], 1)
+
+                self.cells += [cell1_1, cell1_2, cell2_1, cell2_2, cell2_3, cell3_1, cell3_2, cell3_3, cell4_1, cell4_2]
+
+            else:
+                cell1_1 = Cell(self._steps, self._num_channels[1], self._num_channels[1], self._num_channels[1], 1)
+                cell1_2 = Cell(self._steps, self._num_channels[1], self._num_channels[2], self._num_channels[1], 0)
+                cell2_1 = Cell(self._steps, self._num_channels[2], self._num_channels[1], self._num_channels[2], 2)
+                cell2_2 = Cell(self._steps, self._num_channels[2], self._num_channels[2], self._num_channels[2], 1)
+                cell2_3 = Cell(self._steps, self._num_channels[2], self._num_channels[3], self._num_channels[2], 0)
+                cell3_1 = Cell(self._steps, self._num_channels[3], self._num_channels[2], self._num_channels[3], 2)
+                cell3_2 = Cell(self._steps, self._num_channels[3], self._num_channels[3], self._num_channels[3], 1)
+                cell3_3 = Cell(self._steps, self._num_channels[3], self._num_channels[4], self._num_channels[3], 0)
+                cell4_1 = Cell(self._steps, self._num_channels[4], self._num_channels[3], self._num_channels[4], 2)
+                cell4_2 = Cell(self._steps, self._num_channels[4], self._num_channels[4], self._num_channels[4], 1)
+
+                self.cells += [cell1_1, cell1_2, cell2_1, cell2_2, cell2_3, cell3_1, cell3_2, cell3_3, cell4_1, cell4_2]
+
+        self.aspp_4 = nn.Sequential(ASPP(self._num_channels[1], 256, 24, 24))
+        self.aspp_8 = nn.Sequential(ASPP(self._num_channels[2], 256, 12, 12))
+        self.aspp_16 = nn.Sequential(ASPP(self._num_channels[3], 256, 6, 6))
+        self.aspp_32 = nn.Sequential(ASPP(self._num_channels[4], 256, 3, 3))
+        self.final_conv = nn.Conv2d(1024, self._num_classes, 1, stride=1, padding=0)
+        #self.final_conv = nn.Conv2d(300, num_classes, 1, stride=1, padding=0)
+        #self.up_sample = nn.Upsample(size=[224,224], mode='bilinear', align_corners=False)
+
+    def forward(self, x):
+        s0 = [self.stem1(x)]
+        s1 = [self.stem2(s0[-1])]
+
+        count = 0
+        # img_device = torch.device('cuda', x.get_device())
+        # self.alphas_cell = self.alphas_cell.to(device=img_device)
+        # self.alphas_network = self.alphas_network.to(device=img_device)
+        w_alpha = F.softmax(self.w_alpha, -1)
+        w_beta = [F.softmax(p[1], 0) for p in self.named_parameters() if p[0].find('w_beta') == 0]
+
+        for layer in range(self._num_layers):
+            if layer == 0:
+                level4_new = self.cells[count](None, s1[0], w_alpha)
+                count += 1
+                level8_new = self.cells[count](None, s1[0], w_alpha)
+                count += 1
+
+                s0, s1 = s1, [level4_new, level8_new]
+
+            elif layer == 1:
+                level4_new_1 = self.cells[count](s0[0], s1[0], w_alpha)
+                count += 1
+                level4_new_2 = self.cells[count](s0[0], s1[1], w_alpha)
+                count += 1
+                level4_new = w_beta[1][0] * level4_new_1 + w_beta[2][0] * level4_new_2
+
+                level8_new_1 = self.cells[count](None, s1[0], w_alpha)
+                count += 1
+                level8_new_2 = self.cells[count](None, s1[1], w_alpha)
+                count += 1
+                level8_new = w_beta[1][1] * level8_new_1 + w_beta[2][1] * level8_new_2
+
+                level16_new = self.cells[count](None, s1[1], w_alpha)
+                level16_new = level16_new * w_beta[2][2]
+                count += 1
+
+                s0, s1 = s1, [level4_new, level8_new, level16_new]
+
+            elif layer == 2:
+                level4_new_1 = self.cells[count](s0[0], s1[0], w_alpha)
+                count += 1
+                level4_new_2 = self.cells[count](s0[0], s1[1], w_alpha)
+                count += 1
+                level4_new = w_beta[3][0] * level4_new_1 + w_beta[4][1] * level4_new_2
+
+                level8_new_1 = self.cells[count](s0[1], s1[0], w_alpha)
+                count += 1
+                level8_new_2 = self.cells[count](s0[1], s1[1], w_alpha)
+                count += 1
+                level8_new_3 = self.cells[count](s0[1], s1[2], w_alpha)
+                count += 1
+                level8_new = w_beta[3][1] * level8_new_1 + w_beta[4][1] * level8_new_2 + w_beta[5][0] * level8_new_3
+
+                level16_new_1 = self.cells[count](None, s1[1], w_alpha)
+                count += 1
+                level16_new_2 = self.cells[count](None, s1[2], w_alpha)
+                count += 1
+                level16_new = w_beta[4][2] * level16_new_1 + w_beta[5][1] * level16_new_2
+
+                level32_new = self.cells[count](None, s1[2], w_alpha)
+                level32_new = level32_new * w_beta[5][2]
+                count += 1
+
+                s0, s1 = s1, [level4_new, level8_new, level16_new, level32_new]
+
+            elif layer == 3:
+                level4_new_1 = self.cells[count](s0[0], s1[0], w_alpha)
+                count += 1
+                level4_new_2 = self.cells[count](s0[0], s1[1], w_alpha)
+                count += 1
+                level4_new = w_beta[6][0] * level4_new_1 + w_beta[7][0] * level4_new_2
+
+                level8_new_1 = self.cells[count](s0[1], s1[0], w_alpha)
+                count += 1
+                level8_new_2 = self.cells[count](s0[1], s1[1], w_alpha)
+                count += 1
+                level8_new_3 = self.cells[count](s0[1], s1[2], w_alpha)
+                count += 1
+                level8_new = w_beta[6][1] * level8_new_1 + w_beta[7][1] * level8_new_2 + w_beta[8][0] * level8_new_3
+
+                level16_new_1 = self.cells[count](s0[2], s1[1], w_alpha)
+                count += 1
+                level16_new_2 = self.cells[count](s0[2], s1[2], w_alpha)
+                count += 1
+                level16_new_3 = self.cells[count](s0[2], s1[3], w_alpha)
+                count += 1
+                level16_new = w_beta[7][2] * level16_new_1 + w_beta[8][1] * level16_new_2 + w_beta[9][0] * level16_new_3
+
+                level32_new_1 = self.cells[count](None, s1[2], w_alpha)
+                count += 1
+                level32_new_2 = self.cells[count](None, s1[3], w_alpha)
+                count += 1
+                level32_new = w_beta[8][2] * level32_new_1 + w_beta[9][1] * level32_new_2
+
+                s0, s1 = s1, [level4_new, level8_new, level16_new, level32_new]
+
+            else:
+                level4_new_1 = self.cells[count](s0[0], s1[0], w_alpha)
+                count += 1
+                level4_new_2 = self.cells[count](s0[0], s1[1], w_alpha)
+                count += 1
+                level4_new = w_beta[layer*4-6][0] * level4_new_1 + w_beta[layer*4-5][0] * level4_new_2
+
+                level8_new_1 = self.cells[count](s0[1], s1[0], w_alpha)
+                count += 1
+                level8_new_2 = self.cells[count](s0[1], s1[1], w_alpha)
+                count += 1
+                level8_new_3 = self.cells[count](s0[1], s1[2], w_alpha)
+                count += 1
+                level8_new = w_beta[layer*4-6][1] * level8_new_1 + w_beta[layer*4-5][1] * level8_new_2 + w_beta[layer*4-4][0] * level8_new_3
+
+                level16_new_1 = self.cells[count](s0[2], s1[1], w_alpha)
+                count += 1
+                level16_new_2 = self.cells[count](s0[2], s1[2], w_alpha)
+                count += 1
+                level16_new_3 = self.cells[count](s0[2], s1[3], w_alpha)
+                count += 1
+                level16_new = w_beta[layer*4-5][2] * level16_new_1 + w_beta[layer*4-4][1] * level16_new_2 + w_beta[layer*4-3][0] * level16_new_3
+
+
+                level32_new_1 = self.cells[count](s0[3], s1[2], w_alpha)
+                count += 1
+                level32_new_2 = self.cells[count](s0[3], s1[3], w_alpha)
+                count += 1
+                level32_new = w_beta[layer*4-4][2] * level32_new_1 + w_beta[layer*4-3][1] * level32_new_2
+
+                s0, s1 = s1, [level4_new, level8_new, level16_new, level32_new]
+
+        # concate_feature_map = torch.cat ([self.level_4[-1], self.level_8[-1],self.level_16[-1], self.level_32[-1]], 1)
+        aspp_result_4 = self.aspp_4(s1[0])
+        aspp_result_8 = self.aspp_8(s1[1])
+        aspp_result_16 = self.aspp_16(s1[2])
+        aspp_result_32 = self.aspp_32(s1[3])
+        upsample = nn.Upsample(size=x.size()[2:], mode='bilinear', align_corners=True)
+        aspp_result_4 = upsample(aspp_result_4)
+        aspp_result_8 = upsample(aspp_result_8)
+        aspp_result_16 = upsample(aspp_result_16)
+        aspp_result_32 = upsample(aspp_result_32)
+
+        concate_feature_map = torch.cat([aspp_result_4, aspp_result_8, aspp_result_16, aspp_result_32], 1)
+        out = self.final_conv(concate_feature_map)
+        return out
+
+    def _initialize_alphas(self):
+        k = sum(i + 2 for i in range(self._steps))
+        num_ops = len(PRIMITIVES)
+        # self.w_alpha = torch.tensor(1e-3*torch.randn(k, num_ops).cuda(), requires_grad=True)
+        # self.alphas_network = torch.tensor(1e-3*torch.randn(self._num_layers, 4, 3).cuda(), requires_grad=True)
+        self.register_parameter('w_alpha', nn.Parameter(1e-3*torch.randn(k, num_ops)))
+        for i_l in range(self._num_layers):
+            if i_l == 0:
+                self.register_parameter('w_beta{}_0'.format(i_l), nn.Parameter(1e-3*torch.randn(2)))
+            elif i_l == 1:
+                self.register_parameter('w_beta{}_0'.format(i_l), nn.Parameter(1e-3*torch.randn(2)))
+                self.register_parameter('w_beta{}_1'.format(i_l), nn.Parameter(1e-3*torch.randn(3)))
+            elif i_l == 2:
+                self.register_parameter('w_beta{}_0'.format(i_l), nn.Parameter(1e-3*torch.randn(2)))
+                self.register_parameter('w_beta{}_1'.format(i_l), nn.Parameter(1e-3*torch.randn(3)))
+                self.register_parameter('w_beta{}_2'.format(i_l), nn.Parameter(1e-3*torch.randn(3)))
+            else:
+                self.register_parameter('w_beta{}_0'.format(i_l), nn.Parameter(1e-3*torch.randn(2)))
+                self.register_parameter('w_beta{}_1'.format(i_l), nn.Parameter(1e-3*torch.randn(3)))
+                self.register_parameter('w_beta{}_2'.format(i_l), nn.Parameter(1e-3*torch.randn(3)))
+                self.register_parameter('w_beta{}_3'.format(i_l), nn.Parameter(1e-3*torch.randn(2)))
+        self.w_beta = [p[1] for p in self.named_parameters() if p[0].find('w_beta') > 0]
+        self._arch_parameters = [self.w_alpha] + self.w_beta
+
+    def decode_network(self):
+        best_result = []
+        max_prop = 0
+
+        def _parse(weight_network, layer, curr_value, curr_result, last):
+            nonlocal best_result
+            nonlocal max_prop
+            if layer == self._num_layers:
+                if max_prop < curr_value:
+                    # print (curr_result)
+                    best_result = curr_result[:]
+                    max_prop = curr_value
+                return
+
+            if layer == 0:
+                print('begin0')
+                num = 0
+                if last == num:
+                    curr_value = curr_value * weight_network[layer][num][0]
+                    curr_result.append([num, 0])
+                    _parse(weight_network, layer + 1, curr_value, curr_result, 0)
+                    curr_value = curr_value / weight_network[layer][num][0]
+                    curr_result.pop()
+                    print('end0-1')
+                    curr_value = curr_value * weight_network[layer][num][1]
+                    curr_result.append([num,1])
+                    _parse(weight_network, layer + 1, curr_value, curr_result, 1)
+                    curr_value = curr_value / weight_network[layer][num][1]
+                    curr_result.pop()
+
+            elif layer == 1:
+                print('begin1')
+
+                num = 0
+                if last == num:
+                    curr_value = curr_value * weight_network[layer][num][0]
+                    curr_result.append([num, 0])
+                    _parse(weight_network, layer + 1, curr_value, curr_result, 0)
+                    curr_value = curr_value / weight_network[layer][num][0]
+                    curr_result.pop ()
+                    print('end1-1')
+
+                    curr_value = curr_value * weight_network[layer][num][1]
+                    curr_result.append([num, 1])
+                    _parse (weight_network, layer + 1, curr_value, curr_result, 1)
+                    curr_value = curr_value / weight_network[layer][num][1]
+                    curr_result.pop()
+
+                num = 1
+                if last == num:
+                    curr_value = curr_value * weight_network[layer][num][0]
+                    curr_result.append([num, 0])
+                    _parse(weight_network, layer + 1, curr_value, curr_result, 0)
+                    curr_value = curr_value / weight_network[layer][num][0]
+                    curr_result.pop()
+                    curr_value = curr_value * weight_network[layer][num][1]
+                    curr_result.append([num, 1])
+                    _parse(weight_network, layer + 1, curr_value, curr_result, 1)
+                    curr_value = curr_value / weight_network[layer][num][1]
+                    curr_result.pop()
+                    curr_value = curr_value * weight_network[layer][num][2]
+                    curr_result.append([num, 2])
+                    _parse(weight_network, layer + 1, curr_value, curr_result, 2)
+                    curr_value = curr_value / weight_network[layer][num][2]
+                    curr_result.pop ()
+
+            elif layer == 2 :
+                print('begin2')
+
+                num = 0
+                if last == num:
+                    curr_value = curr_value * weight_network[layer][num][0]
+                    curr_result.append([num, 0])
+                    _parse(weight_network, layer + 1, curr_value, curr_result, 0)
+                    curr_value = curr_value / weight_network[layer][num][0]
+                    curr_result.pop()
+                    print('end2-1')
+                    curr_value = curr_value * weight_network[layer][num][1]
+                    curr_result.append([num, 1])
+                    _parse(weight_network, layer + 1, curr_value, curr_result, 1)
+                    curr_value = curr_value / weight_network[layer][num][1]
+                    curr_result.pop()
+
+                num = 1
+                if last == num:
+                    curr_value = curr_value * weight_network[layer][num][0]
+                    curr_result.append([num,0])
+                    _parse(weight_network, layer + 1, curr_value, curr_result, 0)
+                    curr_value = curr_value / weight_network[layer][num][0]
+                    curr_result.pop()
+                    curr_value = curr_value * weight_network[layer][num][1]
+                    curr_result.append([num, 1])
+                    _parse(weight_network, layer + 1, curr_value, curr_result, 1)
+                    curr_value = curr_value / weight_network[layer][num][1]
+                    curr_result.pop()
+                    curr_value = curr_value * weight_network[layer][num][2]
+                    curr_result.append([num, 2])
+                    _parse(weight_network, layer + 1, curr_value, curr_result, 2)
+                    curr_value = curr_value / weight_network[layer][num][2]
+                    curr_result.pop()
+
+                num = 2
+                if last == num:
+                    curr_value = curr_value * weight_network[layer][num][0]
+                    curr_result.append([num, 0])
+                    _parse(weight_network, layer + 1, curr_value, curr_result, 1)
+                    curr_value = curr_value / weight_network[layer][num][0]
+                    curr_result.pop()
+                    curr_value = curr_value * weight_network[layer][num][1]
+                    curr_result.append([num, 1])
+                    _parse(weight_network, layer + 1, curr_value, curr_result, 2)
+                    curr_value = curr_value / weight_network[layer][num][1]
+                    curr_result.pop()
+                    curr_value = curr_value * weight_network[layer][num][2]
+                    curr_result.append([num, 2])
+                    _parse(weight_network, layer + 1, curr_value, curr_result, 3)
+                    curr_value = curr_value / weight_network[layer][num][2]
+                    curr_result.pop()
+            else:
+                num = 0
+                if last == num:
+                    curr_value = curr_value * weight_network[layer][num][0]
+                    curr_result.append([num, 0])
+                    _parse(weight_network, layer + 1, curr_value, curr_result, 0)
+                    curr_value = curr_value / weight_network[layer][num][0]
+                    curr_result.pop()
+
+                    curr_value = curr_value * weight_network[layer][num][1]
+                    curr_result.append([num, 1])
+                    _parse(weight_network, layer + 1, curr_value, curr_result, 1)
+                    curr_value = curr_value / weight_network[layer][num][1]
+                    curr_result.pop()
+
+                num = 1
+                if last == num:
+                    curr_value = curr_value * weight_network[layer][num][0]
+                    curr_result.append([num, 0])
+                    _parse(weight_network, layer + 1, curr_value, curr_result, 0)
+                    curr_value = curr_value / weight_network[layer][num][0]
+                    curr_result.pop()
+
+                    curr_value = curr_value * weight_network[layer][num][1]
+                    curr_result.append([num, 1])
+                    _parse (weight_network, layer + 1, curr_value, curr_result, 1)
+                    curr_value = curr_value / weight_network[layer][num][1]
+                    curr_result.pop()
+
+                    curr_value = curr_value * weight_network[layer][num][2]
+                    curr_result.append([num, 2])
+                    _parse(weight_network, layer + 1, curr_value, curr_result, 2)
+                    curr_value = curr_value / weight_network[layer][num][2]
+                    curr_result.pop()
+
+                num = 2
+                if last == num:
+                    curr_value = curr_value * weight_network[layer][num][0]
+                    curr_result.append([num, 0])
+                    _parse(weight_network, layer + 1, curr_value, curr_result, 1)
+                    curr_value = curr_value / weight_network[layer][num][0]
+                    curr_result.pop()
+
+                    curr_value = curr_value * weight_network[layer][num][1]
+                    curr_result.append([num, 1])
+                    _parse(weight_network, layer + 1, curr_value, curr_result, 2)
+                    curr_value = curr_value / weight_network[layer][num][1]
+                    curr_result.pop()
+
+                    curr_value = curr_value * weight_network[layer][num][2]
+                    curr_result.append([num, 2])
+                    _parse(weight_network, layer + 1, curr_value, curr_result, 3)
+                    curr_value = curr_value / weight_network[layer][num][2]
+                    curr_result.pop()
+
+                num = 3
+                if last == num:
+                    curr_value = curr_value * weight_network[layer][num][0]
+                    curr_result.append([num, 0])
+                    _parse(weight_network, layer + 1, curr_value, curr_result, 2)
+                    curr_value = curr_value / weight_network[layer][num][0]
+                    curr_result.pop()
+
+                    curr_value = curr_value * weight_network[layer][num][1]
+                    curr_result.append([num, 1])
+                    _parse(weight_network, layer + 1, curr_value, curr_result, 3)
+                    curr_value = curr_value / weight_network[layer][num][1]
+                    curr_result.pop()
+        network_weight = F.softmax(self.alphas_network, dim=-1) * 5
+        network_weight = network_weight.data.cpu().numpy()
+        _parse(network_weight, 0, 1, [], 0)
+        print(max_prop)
+        return best_result
+
+    def arch_parameters(self):
+        return self._arch_parameters
+
+    def genotype(self):
+        def _parse(weights):
+            gene = []
+            n = 2
+            start = 0
+            for i in range(self._steps):
+                end = start + n
+                W = weights[start:end].copy()
+                edges = sorted(range(i + 2), key=lambda x: -max(W[x][k] for k in range(len(W[x])) if k != PRIMITIVES.index('none')))[:2]
+                for j in edges:
+                    k_best = None
+                    for k in range(len(W[j])):
+                        if k != PRIMITIVES.index('none'):
+                            if k_best is None or W[j][k] > W[j][k_best]:
+                                k_best = k
+                    gene.append((PRIMITIVES[k_best], j))
+                start = end
+                n += 1
+            return gene
+
+        gene_cell = _parse(F.softmax(self.alphas_cell, dim=-1).data.cpu().numpy())
+        concat = range(2+self._steps-self._multiplier, self._steps+2)
+        genotype = Genotype(
+            cell=gene_cell, cell_concat=concat
+        )
+        return genotype
+
+    def _loss(self, input, target):
+        logits = self(input)
+        return self._criterion(logits, target)
+
+def main():
+    model = AutoDeeplab(7, 12, None)
+    x = torch.ones(4, 3, 224, 224)
+    # result = model.decode_network()
+    # print(result)
+    # print(model.genotype())
+    # x = x.cuda()
+    y = model(x)
+    print(model.arch_parameters())
+    print(y.size())
+
+if __name__ == '__main__' :
+    main()
+
